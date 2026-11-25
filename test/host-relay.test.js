@@ -127,6 +127,8 @@ test("故障路径：断线重连并重放扩展 hello、分片帧、双向 ping
 
   const host = startHost(PORT + 1, t);
   assert.deepEqual(await host.next(), { type: "bridge", connected: true });
+  // 同下：stdout 的"已连接"可能先于 TCP 上的 hello 到达
+  await until(() => conns[0]?.frames.length >= 1, "首个连接上的 host hello");
   const c1 = conns[0];
   assert.equal(c1.frames[0].client, "host");
 
@@ -148,10 +150,11 @@ test("故障路径：断线重连并重放扩展 hello、分片帧、双向 ping
   c1.sock.destroy();
   assert.deepEqual(await host.next(), { type: "bridge", connected: false });
   assert.deepEqual(await host.next(), { type: "bridge", connected: true });
+  // host 的 hello 走 TCP、"bridge connected" 走 stdout，两条通道谁先到不定：先把两帧等齐再断言
+  // （CI 上曾因先断言后等待而间歇失败）
+  await until(() => conns[0] !== c1 && conns[0].frames.length >= 2, "重连后的 host hello 与重放的扩展 hello");
   const c2 = conns[0];
-  assert.notEqual(c2, c1);
   assert.equal(c2.frames[0].client, "host");
-  await until(() => c2.frames.length >= 2, "重连后重放扩展 hello");
   assert.deepEqual(c2.frames[1], extHello);
 
   // 分片：一帧拆两半发，应拼回一帧
