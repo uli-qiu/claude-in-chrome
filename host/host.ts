@@ -6,14 +6,15 @@
 //       --bridge-port <port>  默认 8765
 //       --selftest           不挂 stdin，向 bridge 发 hello+ping 后退出（安装验证用）
 //
-// 日志: 同目录 host.log（stderr 也会写，Chrome 会丢弃 stderr）
+// 日志: 同目录 host.log（stderr 也会写，Chrome 会丢弃 stderr）；超过 2MB 轮转为 host.log.old
+//       可用 CLAUDE_IN_CHROME_HOST_LOG 改路径（部署目录只读、或测试时用）
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync, renameSync, rmSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import net from "node:net";
 
 const MAX_FRAME = 1048576;
-const VERSION = "0.3.0";
+const VERSION = "0.4.0";
 const PING_INTERVAL = 30000;
 
 function parseArgs() {
@@ -44,27 +45,48 @@ function parseArgs() {
 
 const cfg = parseArgs();
 
-const LOG_PATH = join(dirname(process.execPath), "host.log");
+const LOG_PATH = process.env.CLAUDE_IN_CHROME_HOST_LOG ?? join(dirname(process.execPath), "host.log");
+const LOG_MAX_BYTES = 2 * 1024 * 1024; // 超过则轮转为 host.log.old（只留一份）
+
+// 没有 MCP 会话在听时，host 每 3s 重连一次；日志不轮转会无限增长
+// （实测两个浏览器实例 17 天刷到 8.9MB）。appendFileSync 每次开关文件，重命名是安全的。
+let logBytes = -1; // LOG_PATH 当前大小（进程内累加；<0 表示下次写之前重新 stat）
 function log(msg: string) {
   const line = `[${new Date().toISOString()}] [claude-in-chrome host] ${msg}\n`;
   try {
+    // 全新安装时日志还不存在：从 0 起算（直接 stat 会 ENOENT，被下面 catch 掉就一行都写不出来）
+    if (logBytes < 0) logBytes = existsSync(LOG_PATH) ? statSync(LOG_PATH).size : 0;
+    if (logBytes > LOG_MAX_BYTES) {
+      rmSync(`${LOG_PATH}.old`, { force: true });
+      renameSync(LOG_PATH, `${LOG_PATH}.old`);
+      logBytes = 0;
+    }
     appendFileSync(LOG_PATH, line);
-  } catch {}
+    logBytes += line.length;
+  } catch {
+    logBytes = -1; // 写不进去（只读目录/被占用）：下次重新 stat 再试，不抛
+  }
   console.error(line.trimEnd());
 }
 
+// Windows 版 bun 连不上时抛的是 AggregateError：message 为空、只有 code——所以带上 code
+function describeError(e: unknown): string {
+  const err = e as { code?: string; message?: string; name?: string } | null;
+  return [err?.code, err?.message].filter(Boolean).join(": ") || err?.name || String(e);
+}
+
 // ---------------------------------------------------------------------------
-// Native messaging 帧 IO（stdin/stdout）
+// 帧编解码（stdin 与 TCP 同构，共用）
 // ---------------------------------------------------------------------------
-function writeStdoutFrame(obj: unknown) {
+function encodeFrame(obj: unknown): Buffer {
   const body = Buffer.from(JSON.stringify(obj), "utf-8");
   const head = Buffer.alloc(4);
   head.writeUInt32LE(body.length, 0);
-  process.stdout.write(Buffer.concat([head, body]));
+  return Buffer.concat([head, body]);
 }
 
+// 解析缓冲区里所有完整帧，返回剩余字节；坏帧长度抛错，由调用方断连/退出
 function decodeFrames(buffer: Buffer): { frames: object[]; rest: Buffer } {
-  // 解析缓冲区里所有完整帧，返回剩余字节
   const frames: object[] = [];
   let buf = buffer;
   while (buf.length >= 4) {
@@ -77,17 +99,35 @@ function decodeFrames(buffer: Buffer): { frames: object[]; rest: Buffer } {
   return { frames, rest: buf };
 }
 
+const writeStdoutFrame = (obj: unknown) => process.stdout.write(encodeFrame(obj));
+function writeTcpFrame(obj: unknown) {
+  if (tcp?.writable) tcp.write(encodeFrame(obj));
+}
+// 把"到 bridge 的 TCP 是否在连"报给扩展：扩展据此显示/判定已连接，
+// 否则 native port 一建立（host.exe 刚被拉起）扩展就显示已连接，而 TCP 可能还在重试
+// （selftest 模式 stdout 面向终端，不发）
+const tellBridgeState = (connected: boolean) => {
+  if (!cfg.selftest) writeStdoutFrame({ type: "bridge", connected });
+};
+
 // ---------------------------------------------------------------------------
 // TCP 连接（指数退避重连）
 // ---------------------------------------------------------------------------
 let tcp: net.Socket | null = null;
 let tcpConnected = false;
 let stdinRest = Buffer.alloc(0);
+let tcpBuf = Buffer.alloc(0);
 let pingTimer: ReturnType<typeof setInterval> | null = null;
 let pongsMissed = 0;
+// 扩展 hello（带 deviceId）只在 native port 建立时发一次；若那时 TCP 尚未连上，
+// 帧会被静默丢弃，server 从此认不出这个浏览器。缓存它，重连成功后随 host hello 重放。
+let extHello: object | null = null;
 
 function connectTcp(onFrame: (f: object) => void, onUp: () => void) {
   let attempt = 0;
+  // 相同的连续连接错误不重复记（每 50 次提一句还在重试）；连上过一次后重新开始记
+  let lastError = "";
+  let repeats = 0;
   const tryConnect = () => {
     if (tcpConnected) return;
     // localhost 桥：服务端随 Claude Code 会话重启，退避封顶 3s，
@@ -96,12 +136,15 @@ function connectTcp(onFrame: (f: object) => void, onUp: () => void) {
     setTimeout(() => {
       const sock = net.connect(cfg.port, cfg.host, () => {
         attempt = 0;
+        lastError = "";
+        repeats = 0;
         tcp = sock;
         tcpConnected = true;
         pongsMissed = 0;
         log(`connected to bridge ${cfg.host}:${cfg.port}`);
-        sock.write(encodeTcpFrame({ type: "hello", client: "host", version: VERSION, pid: process.pid }));
+        writeTcpFrame({ type: "hello", client: "host", version: VERSION, pid: process.pid });
         onUp();
+        tellBridgeState(true);
         pingTimer = setInterval(() => {
           if (!tcpConnected) return;
           writeTcpFrame({ type: "ping", ts: Date.now() });
@@ -113,14 +156,26 @@ function connectTcp(onFrame: (f: object) => void, onUp: () => void) {
       });
       sock.on("data", (chunk) => {
         try {
-          for (const f of parseTcpBuffer(chunk)) onFrame(f);
+          const { frames, rest } = decodeFrames(Buffer.concat([tcpBuf, chunk]));
+          tcpBuf = rest;
+          for (const f of frames) onFrame(f);
         } catch (e) {
           log(`bad frame from bridge: ${(e as Error).message}`);
           sock.destroy();
         }
       });
-      sock.on("error", (e) => log(`tcp error: ${e.message}`));
+      sock.on("error", (e) => {
+        const desc = describeError(e);
+        if (desc !== lastError) {
+          log(`tcp error: ${desc}`);
+          lastError = desc;
+          repeats = 0;
+        } else if (++repeats % 50 === 0) {
+          log(`tcp error: ${desc} (×${repeats}, still retrying)`);
+        }
+      });
       sock.on("close", () => {
+        if (tcpConnected) tellBridgeState(false);
         tcpConnected = false;
         if (pingTimer) clearInterval(pingTimer);
         if (!process.exitCode) tryConnect();
@@ -128,30 +183,6 @@ function connectTcp(onFrame: (f: object) => void, onUp: () => void) {
     }, attempt++ === 0 ? 0 : wait);
   };
   tryConnect();
-}
-
-let tcpBuf = Buffer.alloc(0);
-function parseTcpBuffer(chunk: Buffer): object[] {
-  tcpBuf = Buffer.concat([tcpBuf, chunk]);
-  const out: object[] = [];
-  while (tcpBuf.length >= 4) {
-    const len = tcpBuf.readUInt32LE(0);
-    if (len === 0 || len > MAX_FRAME) throw new Error(`invalid frame length ${len}`);
-    if (tcpBuf.length < 4 + len) break;
-    out.push(JSON.parse(tcpBuf.subarray(4, 4 + len).toString("utf-8")));
-    tcpBuf = tcpBuf.subarray(4 + len);
-  }
-  return out;
-}
-
-function encodeTcpFrame(obj: unknown): Buffer {
-  const body = Buffer.from(JSON.stringify(obj), "utf-8");
-  const head = Buffer.alloc(4);
-  head.writeUInt32LE(body.length, 0);
-  return Buffer.concat([head, body]);
-}
-function writeTcpFrame(obj: unknown) {
-  if (tcp?.writable) tcp.write(encodeTcpFrame(obj));
 }
 
 // ---------------------------------------------------------------------------
@@ -176,17 +207,17 @@ if (cfg.selftest) {
   }, 10000);
 } else {
   // 正常模式：stdin 帧 → TCP，TCP 帧 → stdout（同构帧，纯中继）
-  let stdinClosed = false;
   process.stdin.on("data", (chunk: Buffer) => {
     stdinRest = Buffer.concat([stdinRest, chunk]);
     try {
       const { frames, rest } = decodeFrames(stdinRest);
       stdinRest = rest;
       for (const f of frames) {
-        const m = f as { type?: string; ts?: number };
+        const m = f as { type?: string; client?: string; ts?: number };
         if (m.type === "ping") {
           writeStdoutFrame({ type: "pong", ts: m.ts, now: Date.now() });
         } else {
+          if (m.type === "hello" && m.client === "extension") extHello = f;
           log(`ext→bridge: ${m.type}`);
           writeTcpFrame(f);
         }
@@ -197,7 +228,6 @@ if (cfg.selftest) {
     }
   });
   process.stdin.on("end", () => {
-    stdinClosed = true;
     log("stdin closed (extension went away); exiting");
     process.exit(0);
   });
@@ -217,11 +247,13 @@ if (cfg.selftest) {
       log(`bridge→ext: ${m.type}`);
       writeStdoutFrame(f);
     },
-    () => {}
+    () => {
+      // TCP（重）连成功：重放缓存的扩展 hello，让 server 重新认出本浏览器
+      if (extHello) writeTcpFrame(extHello);
+    }
   );
 
   // 空转防护：extension 断开且 TCP 也断开时进程由 stdin end / Chrome 杀掉
-  void stdinClosed;
   // Bun 下 stdin 需要显式 resume 读取
   (process.stdin as any).resume?.();
 }

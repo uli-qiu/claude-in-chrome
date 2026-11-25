@@ -25,10 +25,13 @@ const PAGE_WALK = `
     }
     return '';
   };
-  // 深度优先递归遍历，穿 shadow root（官方 a11y 树天然覆盖，这里等效补齐）
+  // 深度优先递归遍历：先自己，再光 DOM 子元素，再穿 shadow root（官方 a11y 树天然覆盖，这里等效补齐）。
+  // 过去漏了"递归进普通子元素"这一步，只看 body 的直接子元素——真实网页里几乎没有交互元素
+  // 直接挂在 body 下，snapshot/find/ref 定位因此大面积漏元素（2026-11 实测发现）。
   function* walk(root) {
     for (const el of root.children) {
       yield el;
+      yield* walk(el);
       if (el.shadowRoot) yield* walk(el.shadowRoot);
     }
   }
@@ -205,9 +208,41 @@ async function pressKey(tabId, combo) {
     windowsVirtualKeyCode: vk,
     nativeVirtualKeyCode: vk,
     ...(modifiers === 0 && k.length === 1 ? { text: k, unmodifiedText: k } : {}),
+    // Enter 带上字符语义（Puppeteer 同款 "\r"）：触发原生隐式表单提交，
+    // 不再依赖站点 JS 的 keydown 监听（百度首页的监听器偶尔挂得比输入晚）
+    ...(modifiers === 0 && k === "Enter" ? { text: "\r", unmodifiedText: "\r" } : {}),
   };
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", ...ev });
   await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", ...ev });
 }
 
-export { pageWalk, pageWalkRef, locateTarget, focusTarget, pressKey };
+// browser_js 的 REPL 包装：顶层 await 可用，末表达式的值作为返回值（页面里以 awaitPromise 求值）。
+// 不能在 async 函数里直接 eval(src)：eval 是脚本语义，顶层 await 是语法错误（过去的实现就栽在这）。
+//   1) 整体是表达式（可含 await）→ 编译成 async 函数体 "return (src)"
+//   2) 同步语句序列（普通 Function 能编译）→ eval 取脚本完成值（"var q = 2; q + 3" → 5）
+//   3) 语句 + 顶层 await → 在语句边界（; 换行 } 或源码开头）把最后一个表达式拆出来 return
+function replSource(expression) {
+  return `(async () => {
+  const src = ${JSON.stringify(String(expression))};
+  const AF = Object.getPrototypeOf(async function () {}).constructor;
+  const compile = (body) => { try { return new AF(body); } catch (e) { if (e instanceof SyntaxError) return null; throw e; } };
+  let fn = compile("return (" + src + "\\n)");
+  if (!fn) {
+    try { new Function(src); return await eval(src); } catch (e) { if (!(e instanceof SyntaxError)) throw e; }
+    // 只在语句边界处切，且从后往前取第一个能编译的：在任意位置切会把 "r.ok" 切成 "r." + "ok"
+    // （编译通过，运行时却是另一个意思）。换行后以 ( [ \` + - / . 开头的属于同一条语句（ASI），不切。
+    for (let i = src.length; i >= 1 && !fn; i--) {
+      const tail = src.slice(i);
+      if (!/[^\\s]/.test(tail)) continue;
+      const prev = i ? src[i - 1] : ";"; // i = 0：把整段源码当成最后一个表达式
+      if (prev !== ";" && prev !== "}" && prev !== "\\n") continue;
+      if (prev === "\\n" && /^[([\\x60+.\\-\\/]/.test(tail)) continue;
+      fn = compile(src.slice(0, i) + "\\n;return (" + tail + "\\n)");
+    }
+    if (!fn) fn = new AF(src); // 整段都编译不成"表达式"：语法错误在这里原样抛出，否则整段执行（返回 undefined）
+  }
+  return await fn();
+})()`;
+}
+
+export { PAGE_WALK, pageWalk, pageWalkRef, locateTarget, focusTarget, pressKey, replSource };

@@ -54,7 +54,8 @@ bash install.sh
 旧 manifest、旧 MCP 注册名会被清理；环境变量旧名 `CHROME_BRIDGE_*` 仍回退支持）。
 
 特殊场景：`CLAUDE_IN_CHROME_FORCE_OS=<wsl|linux|macos|windows>` 强制平台；
-`CLAUDE_IN_CHROME_PORT` 换端口；`CHROME_EXT_ID` 显式指定扩展 ID。
+`CLAUDE_IN_CHROME_PORT` 换端口；`CLAUDE_IN_CHROME_DEVICE` 多浏览器时固定默认选择；
+`CHROME_EXT_ID` 显式指定扩展 ID。
 
 随后手动（一次性）：
 
@@ -63,12 +64,13 @@ bash install.sh
 3. 完全退出并重启 Chrome
 4. 重启 Claude Code 会话，调用 `browser_status` 验证连接
 
-## 工具面（22 个）
+## 工具面（23 个）
 
 | 工具 | 说明 |
 |---|---|
 | `browser_status` | 连接状态（排障第一步） |
-| `browser_navigate` | 导航当前/指定标签页 |
+| `browser_select` | 多浏览器并存时选择操作哪个浏览器（无参则列出在连清单） |
+| `browser_navigate` | 无 `tabId`：新开标签（自动进 Claude 组，不动你当前的标签）导航；活动标签已在组内则原地导航；指定 `tabId` 或 `back`/`forward`：操作该标签 |
 | `browser_tabs_list` / `browser_tab_new` / `browser_tab_close` | 标签页管理 |
 | `browser_snapshot` | DOM 快照：元素树 + 可交互元素 `[ref]` 编号 |
 | `browser_get_text` | 提取页面可见文本 |
@@ -76,8 +78,36 @@ bash install.sh
 | `browser_screenshot` | PNG 截图（返回图像内容） |
 | `browser_js` | 页面内执行 JS，REPL 语义（顶层 await + 末表达式返回） |
 | `browser_console` / `browser_network` | 控制台日志 / 网络请求缓冲 |
+| `browser_drag` | 元素/坐标拖放（真实鼠标事件）。不支持原生 HTML5 拖放（`draggable` 元素），会直接报错 |
+| `browser_resize_window` | 改窗口宽高；最大化/最小化的窗口会先回到普通窗口，可用 `state` 指定 normal/maximized/minimized |
 
 站点允许清单：扩展 options 页配置，默认 `*`（全部允许）。
+
+## 多浏览器并存
+
+本机装了两个浏览器（如 Chrome + Edge）且都装了本扩展时，两个都会连到 TCP 桥。
+标识机制与官方 Claude in Chrome 的 `device_id` 同构：**每个浏览器安装扩展时生成一个
+UUID（`deviceId`），持久存在该浏览器 profile 的扩展存储里**，随 hello 帧上报。
+
+- 只有一个浏览器在连：行为不变，无需选择。
+- 多个在连：工具**不会瞎猜**（避免误操作日常浏览器），而是报错列出
+  `deviceId (label)` 清单，用 `browser_select` 选定：
+  ```
+  browser_select {"browser": "edge"}                  # 按设备名（options 页可自定义）
+  browser_select {"browser": "andrew@gmail.com"}      # 按 profile 登录邮箱
+  browser_select {"browser": "a2335e1e"}              # 按 deviceId 或其无歧义前缀
+  ```
+  也可用环境变量 `CLAUDE_IN_CHROME_DEVICE` 固定默认选择。
+
+**多个 Chrome profile 窗口**：扩展存储按 profile 隔离，每个 profile 有独立的
+deviceId，天然可区分。label 默认自动取「浏览器名 (该 profile 登录账号邮箱)」
+（`chrome.identity.getProfileUserInfo`，需 manifest 里的 `identity.email` 权限），
+例如 `Chrome (andrew@gmail.com)`——用邮箱即可选定；未登录的 profile 退回浏览器名，
+建议在 options 页给它起个名。同一 profile 开多个窗口属于同一标识（共享标签页视图，
+无需也无法按窗口区分）。
+  也可用环境变量 `CLAUDE_IN_CHROME_DEVICE` 固定默认选择。
+- 选定的浏览器断开时报错提示，不会悄悄切到另一个；同 `deviceId` 重连自动去重。
+- 旧版扩展（不上报 deviceId）：保持后连顶替先连，升级扩展后即支持并存。
 
 ## 典型用法（对 Claude 说）
 
@@ -92,6 +122,16 @@ browser_snapshot 之后点击 [3]，在 [5] 里输入 "hooks" 回车，告诉我
 
 - **工具报 "not connected"**：Chrome 是否在跑、扩展是否加载（`chrome://extensions`）、
   host.log（`C:\Users\<你>\claude-in-chrome\host.log`）；点扩展图标 → Reconnect。
+- **点扩展图标看 popup 的状态**（0.4.0 起由 host.exe 上报，扩展和 host.exe 要一起升级，
+  即重跑 `install.sh`）：
+  - `connected to bridge`：全链路通。
+  - `bridge unreachable`：host.exe 在跑，但连不上 MCP server——Claude Code 会话没起来或端口不对
+    （host.exe ≤3s 自动重试，无需 Reconnect）。
+  - `native host not running`：host.exe 没被拉起——看 host.log 和注册表里的 NativeMessagingHosts
+    （扩展 5s 自动重试）。
+- **Chrome 窗口最小化时工具会把窗口还原**：最小化的窗口不渲染，页面还会按几十像素宽重新布局，
+  点击会落在错误的元素上、截图会挂起。所以每个页面工具执行前都会把最小化的窗口还原成它上次的
+  状态（最大化/普通），Chrome 会因此弹到前台。不想被打扰就先暂停浏览器操作。
 - **localhost 转发失效**（自测失败）：`CLAUDE_IN_CHROME_FORCE_WSL_IP=1 bash install.sh`，
   host.exe 会改连 WSL eth0 IP。
 - **扩展 ID 与 manifest 不符**：`browser_status` 返回实际 extensionId，把它填进

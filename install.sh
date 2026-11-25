@@ -11,8 +11,11 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 HOST_NAME="com.user.claude_in_chrome"
-# 旧名 CHROME_BRIDGE_* 回退支持（存量部署平滑升级）
+# 旧名 CHROME_BRIDGE_* 回退支持（存量部署平滑升级）。
+# 回退出来的端口要回写成新名：后面 MCP 注册与 selftest 起的 server 只读 CLAUDE_IN_CHROME_PORT，
+# 否则 host 连旧名端口、server 听 8765，两边对不上。
 BRIDGE_PORT="${CLAUDE_IN_CHROME_PORT:-${CHROME_BRIDGE_PORT:-8765}}"
+export CLAUDE_IN_CHROME_PORT="$BRIDGE_PORT"
 OLD_HOST_NAME="com.user.chrome_bridge"
 OLD_MCP_NAME="chrome-bridge"
 CLAUDE_JSON="$HOME/.claude.json"

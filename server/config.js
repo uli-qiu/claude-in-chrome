@@ -13,4 +13,9 @@ export const TOOL_TIMEOUT = Number(
 );
 
 export const PROTOCOL_VERSION = "2025-06-18";
-export const SERVER_INFO = { name: "claude-in-chrome", version: "0.3.0" };
+
+// 多浏览器并存时的默认选择（deviceId / id 前缀 / 设备名 label），可用 browser_select 工具覆盖
+export const DEVICE =
+  process.env.CLAUDE_IN_CHROME_DEVICE ?? process.env.CHROME_BRIDGE_DEVICE ?? null;
+
+export const SERVER_INFO = { name: "claude-in-chrome", version: "0.4.0" };

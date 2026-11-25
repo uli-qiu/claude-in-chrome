@@ -4,6 +4,7 @@
 const BUF_SIZE = 200; // console/network 环形缓冲条数
 
 const attached = new Set(); // tabId
+const attaching = new Map(); // tabId → 进行中的 attach 流程
 // tabId → Map(frameId → contextId)；tabId → [{label, contextId, start, end}]（ref 区间）
 const frameCtx = new Map();
 const refRanges = new Map();
@@ -21,20 +22,33 @@ async function assertAttachable(tabId) {
 
 async function ensureAttached(tabId) {
   if (attached.has(tabId)) return;
-  await assertAttachable(tabId);
-  await new Promise((res, rej) => {
-    chrome.debugger.attach({ tabId }, "1.3", () => {
-      const err = chrome.runtime.lastError;
-      if (err) rej(new Error(`debugger.attach: ${err.message}`));
-      else res();
-    });
-  });
-  attached.add(tabId);
-  await rawCdp(tabId, "Runtime.enable");
-  await rawCdp(tabId, "Page.enable");
-  await rawCdp(tabId, "Network.enable", { maxPostDataSize: 65536 });
-  // 后台标签页不失焦即可被控制/截图（官方 ensureFocusEmulation）
-  await rawCdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+  let p = attaching.get(tabId);
+  if (!p) {
+    // 流程中有多个 await：并发的工具调用共用同一次 attach，否则第二次 attach 报
+    // "Another debugger is already attached"
+    p = (async () => {
+      await assertAttachable(tabId);
+      await new Promise((res, rej) => {
+        chrome.debugger.attach({ tabId }, "1.3", () => {
+          const err = chrome.runtime.lastError;
+          if (err) rej(new Error(`debugger.attach: ${err.message}`));
+          else res();
+        });
+      });
+      attached.add(tabId);
+      await rawCdp(tabId, "Runtime.enable");
+      await rawCdp(tabId, "Page.enable");
+      await rawCdp(tabId, "Network.enable", { maxPostDataSize: 65536 });
+      // 后台标签页不失焦即可被控制/截图（官方 ensureFocusEmulation）
+      await rawCdp(tabId, "Emulation.setFocusEmulationEnabled", { enabled: true }).catch(() => {});
+    })();
+    attaching.set(tabId, p);
+  }
+  try {
+    await p;
+  } finally {
+    attaching.delete(tabId);
+  }
 }
 
 chrome.debugger.onDetach.addListener((src) => attached.delete(src.tabId));
@@ -75,6 +89,9 @@ function pushBuf(map, tabId, item) {
   if (list.length > BUF_SIZE) list.splice(0, list.length - BUF_SIZE);
 }
 
+// 按 requestId 找网络缓冲条目（三条 Network.* 事件共用）
+const netItem = (tabId, requestId) => netBuf.get(tabId)?.find((x) => x.requestId === requestId);
+
 chrome.debugger.onEvent.addListener((src, method, params) => {
   if (method === "Runtime.consoleAPICalled") {
     pushBuf(consoleBuf, src.tabId, {
@@ -110,24 +127,21 @@ chrome.debugger.onEvent.addListener((src, method, params) => {
       postData: params.request.postData?.slice(0, 1024),
     });
   } else if (method === "Network.responseReceived") {
-    const list = netBuf.get(src.tabId);
-    const it = list?.find((x) => x.requestId === params.requestId);
+    const it = netItem(src.tabId, params.requestId);
     if (it) {
       it.status = params.response.status;
       it.mime = params.response.mimeType;
       it.responseHeaders = params.response.headers;
     }
   } else if (method === "Network.loadingFinished") {
-    const list = netBuf.get(src.tabId);
-    const it = list?.find((x) => x.requestId === params.requestId);
+    const it = netItem(src.tabId, params.requestId);
     if (it) {
       it.durationMs = Math.round((params.timestamp - it.ts) * 1000);
       it.size = params.encodedDataLength;
       it.done = true;
     }
   } else if (method === "Network.loadingFailed") {
-    const list = netBuf.get(src.tabId);
-    const it = list?.find((x) => x.requestId === params.requestId);
+    const it = netItem(src.tabId, params.requestId);
     if (it) {
       it.failed = params.errorText;
       it.done = true;
@@ -163,16 +177,16 @@ async function evaluate(tabId, expression, { awaitPromise = false, contextId } =
   return r.result?.value;
 }
 
-/** tab 关闭时清理本模块持有的全部状态 */
-function forgetTab(tabId) {
+// tab 关闭（工具关闭或用户手动关）时清理本模块持有的全部状态，不限于 browser_tab_close
+chrome.tabs.onRemoved.addListener((tabId) => {
   attached.delete(tabId);
   consoleBuf.delete(tabId);
   netBuf.delete(tabId);
   frameCtx.delete(tabId);
   refRanges.delete(tabId);
-}
+});
 
 export {
-  attached, consoleBuf, netBuf, frameCtx, refRanges,
-  ensureAttached, cdp, evaluate, forgetTab,
+  consoleBuf, netBuf, frameCtx, refRanges,
+  ensureAttached, cdp, evaluate,
 };

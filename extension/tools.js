@@ -1,43 +1,92 @@
 // 工具实现：host 下发的 tool_request 在此分发。
 // 含站点允许清单门禁（GATED 工具在调用前校验目标 URL）。
 
-import { attached, consoleBuf, netBuf, frameCtx, refRanges, ensureAttached, cdp, evaluate, forgetTab as forgetCdpTab } from "./cdp.js";
-import { indicator, showIndicator, scheduleIndicatorHide, forgetTab as forgetIndicatorTab } from "./indicator.js";
-import { pageWalk, pageWalkRef, locateTarget, focusTarget, pressKey } from "./page.js";
-import { connState } from "./conn-state.js";
+import { consoleBuf, netBuf, frameCtx, refRanges, ensureAttached, cdp, evaluate } from "./cdp.js";
+import { indicator, showIndicator, scheduleIndicatorHide } from "./indicator.js";
+import { pageWalk, pageWalkRef, locateTarget, focusTarget, pressKey, replSource } from "./page.js";
 
 const NAV_TIMEOUT = 20000;
+const DRAG_MOUSE_TIMEOUT = 5000;
+const NATIVE_DRAG_MSG =
+  "the drag source is a native HTML5 draggable — browser_drag cannot drive native drag-and-drop " +
+  "(dispatch dragstart/drop events with browser_js instead)";
 
 const wrap = (fn) => (args) => Promise.resolve(fn(args)).catch((e) => {
   throw new Error(e?.message ?? String(e));
 });
 
-async function resolveTab(args) {
-  if (typeof args.tabId === "number") {
-    await ensureAttached(args.tabId);
-    showIndicator(args.tabId);
-    return args.tabId;
+// 最近聚焦窗口的活动标签（查询失败视为无）
+const activeTab = async () =>
+  (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0];
+
+// Chrome 窗口最小化时页面不渲染，还会按几十像素宽重新布局：鼠标点击落在错误的元素上
+// （工具却返回 clicked:true）、hover/drag 无效、snapshot 漏掉大半元素、截图挂到超时。
+// 所以进任何页面工具之前，先把最小化的窗口还原。记下它上次可见时是最大化还是普通窗口，
+// 按原样还原（否则最大化窗口每次都被降级成普通大小）。
+const winState = new Map(); // windowId → 上次见到的 "maximized" | "normal"
+
+async function ensureRendered(tab) {
+  const win = await chrome.windows.get(tab.windowId).catch(() => null);
+  if (!win) return;
+  if (win.state !== "minimized") {
+    winState.set(win.id, win.state === "maximized" ? "maximized" : "normal");
+    return;
   }
-  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
-    .catch(() => []);
-  const tab = tabs[0] ?? (await chrome.tabs.query({ active: true }))[0];
-  if (!tab) throw new Error("no active tab; pass tabId from browser_tabs_list");
+  await chrome.windows.update(win.id, { state: winState.get(win.id) ?? "normal" });
+  // 等窗口真正恢复并完成布局（两帧 rAF）；窗口仍未显示时 300ms 兜底，不卡住工具
+  await evaluate(
+    tab.id,
+    "new Promise((r) => { const t = setTimeout(r, 300); requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(t); r(); })); })",
+    { awaitPromise: true }
+  ).catch(() => {});
+}
+
+// 页面工具的统一入口：目标 tab 所在窗口必须可见（必要时还原）→ attach → 亮指示器
+async function resolveTab(args) {
+  let tab;
+  if (typeof args.tabId === "number") {
+    tab = { id: args.tabId, windowId: (await chrome.tabs.get(args.tabId).catch(() => null))?.windowId };
+  } else {
+    tab = (await activeTab()) ?? (await chrome.tabs.query({ active: true }))[0];
+    if (!tab) throw new Error("no active tab; pass tabId from browser_tabs_list");
+  }
   await ensureAttached(tab.id);
+  if (tab.windowId !== undefined) await ensureRendered(tab);
   showIndicator(tab.id);
   return tab.id;
+}
+
+// 聚焦目标后全选再输入，覆盖已有内容（type / form_input 共用）
+async function typeInto(tabId, text) {
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", modifiers: 2, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 });
+  await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", modifiers: 2, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 });
+  await cdp(tabId, "Input.insertText", { text: String(text) });
+}
+
+// 开新标签并归入橙色 "Claude" 组（tab_new 与 navigate 的 agent 标签道共用）。
+// 复用规则按 profile 为单位：本 profile 已有 "Claude" 组则复用（优先当前窗口的，
+// 组在别的窗口就把 tab 移过去），没有才新建。tabs/tabGroups API 按 profile 隔离，
+// 多 profile / 多浏览器各自的扩展实例互不可见对方的组，天然独立。
+async function openGroupedTab(url) {
+  const t = await chrome.tabs.create({ url: url ?? "about:blank", active: true });
+  let groupWarning;
+  try {
+    const groups = await chrome.tabGroups.query({ title: "Claude" });
+    const gid = (groups.find((g) => g.windowId === t.windowId) ?? groups[0])?.id;
+    if (gid != null) {
+      await chrome.tabs.group({ tabIds: [t.id], groupId: gid });
+    } else {
+      const created = await chrome.tabs.group({ tabIds: [t.id], createProperties: { windowId: t.windowId } });
+      await chrome.tabGroups.update(created, { title: "Claude", color: "orange" });
+    }
+  } catch (e) { groupWarning = String(e?.message ?? e); }
+  return { tabId: t.id, ...(groupWarning ? { groupWarning } : {}) };
 }
 
 // ---------------------------------------------------------------------------
 // 工具实现
 // ---------------------------------------------------------------------------
 const TOOLS = {
-  status: wrap(async () => ({
-    connected: connState.connected,
-    extensionId: chrome.runtime.id,
-    userAgent: navigator.userAgent,
-    attachedTabs: [...attached],
-  })),
-
   tabs_list: wrap(async () => {
     const tabs = await chrome.tabs.query({});
     const groupNames = new Map((await chrome.tabGroups.query({})).map((g) => [g.id, `${g.title ?? ""}#${g.color ?? ""}`]));
@@ -53,31 +102,31 @@ const TOOLS = {
     }));
   }),
 
-  tab_new: wrap(async (a) => {
-    const t = await chrome.tabs.create({ url: a.url ?? "about:blank", active: true });
-    // 官方模式：agent 开的 tab 归入橙色 Claude 组，与人开的 tab 区分。
-    // 注意 chrome.tabs.group() 返回数字 groupId（不是 {id}）。
-    let groupWarning;
-    try {
-      const groups = await chrome.tabGroups.query({ title: "Claude", windowId: t.windowId });
-      if (groups[0]) {
-        await chrome.tabs.group({ tabIds: [t.id], groupId: groups[0].id });
-      } else {
-        const gid = await chrome.tabs.group({ tabIds: [t.id], createProperties: { windowId: t.windowId } });
-        await chrome.tabGroups.update(gid, { title: "Claude", color: "orange" });
-      }
-    } catch (e) { groupWarning = String(e?.message ?? e); }
-    return { tabId: t.id, ...(groupWarning ? { groupWarning } : {}) };
-  }),
+  // 官方模式：agent 开的 tab 归入橙色 Claude 组，与人开的 tab 区分。
+  // 注意 chrome.tabs.group() 返回数字 groupId（不是 {id}）。
+  tab_new: wrap(async (a) => openGroupedTab(a.url)),
 
+  // 缓冲等状态的清理由 chrome.tabs.onRemoved 统一做（见 cdp.js / indicator.js）
   tab_close: wrap(async (a) => {
     await chrome.tabs.remove(a.tabId);
-    forgetCdpTab(a.tabId);
-    forgetIndicatorTab(a.tabId);
     return { closed: a.tabId };
   }),
 
   navigate: wrap(async (a) => {
+    // agent 打开页面一律走自己的标签道：无 tabId 的 URL 导航开新标签（进 Claude 组），
+    // 绝不动用户当前的活动标签；活动标签本身已在 Claude 组内（agent 上一步开的）则
+    // 原地导航，连续导航不膨胀。显式 tabId 或 back/forward 维持原语义。
+    if (typeof a.tabId !== "number" && !/^(back|forward)$/i.test(String(a.url))) {
+      const active = await activeTab();
+      const grp = active?.groupId != null && active.groupId !== -1
+        ? await chrome.tabGroups.get(active.groupId).catch(() => null)
+        : null;
+      if (grp?.title !== "Claude") {
+        // 先开 about:blank 再走下方统一的导航路径：load 监听先于导航建立，不丢加载事件
+        const opened = await openGroupedTab("about:blank");
+        a = { ...a, tabId: opened.tabId };
+      }
+    }
     const tabId = await resolveTab(a);
     const loaded = new Promise((res) => {
       const timer = setTimeout(() => {
@@ -187,10 +236,7 @@ const TOOLS = {
     const tabId = await resolveTab(a);
     await focusTarget(tabId, a);
     await new Promise((r2) => setTimeout(r2, 150));
-    // 全选后输入，覆盖已有内容
-    await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", modifiers: 2, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 });
-    await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", modifiers: 2, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 });
-    await cdp(tabId, "Input.insertText", { text: String(a.text) });
+    await typeInto(tabId, a.text);
     if (a.submit) {
       await pressKey(tabId, "Enter");
       await new Promise((r2) => setTimeout(r2, 800));
@@ -204,20 +250,18 @@ const TOOLS = {
     let format = a.format === "jpeg" ? "jpeg" : "png";
     const params = { format, fromSurface: true };
     if (format === "jpeg") params.quality = Math.max(1, Math.min(100, a.quality ?? 75));
-    let clip = null;
+    let metrics; // fullPage 已取过布局尺寸，结尾不重复取
     if (a.ref !== undefined || a.selector) {
       // 区域截图 / 放大（官方 zoom：png + clip + scale）
       const t = await locateTarget(tabId, a);
-      clip = { x: Math.max(0, t.x ?? t.cx - 200), y: Math.max(0, t.y ?? t.cy - 150), width: t.w ?? 400, height: t.h ?? 300, scale: Math.max(1, Math.min(4, Number(a.scale) || 1)) };
       format = params.format = "png";
       delete params.quality;
-      params.clip = clip;
+      params.clip = { x: Math.max(0, t.x ?? t.cx - 200), y: Math.max(0, t.y ?? t.cy - 150), width: t.w ?? 400, height: t.h ?? 300, scale: Math.max(1, Math.min(4, Number(a.scale) || 1)) };
     } else if (a.fullPage) {
-      const m0 = await cdp(tabId, "Page.getLayoutMetrics");
-      const cs = m0?.cssContentSize ?? {};
+      metrics = await cdp(tabId, "Page.getLayoutMetrics");
+      const cs = metrics?.cssContentSize ?? {};
       params.captureBeyondViewport = true;
-      clip = { x: 0, y: 0, width: cs.width ?? 0, height: cs.height ?? 0, scale: 1 };
-      params.clip = clip;
+      params.clip = { x: 0, y: 0, width: cs.width ?? 0, height: cs.height ?? 0, scale: 1 };
     }
     let r = await cdp(tabId, "Page.captureScreenshot", params);
     // JPEG 自适应降质（官方 MAX_BASE64_CHARS 同款阈值）
@@ -228,21 +272,20 @@ const TOOLS = {
         r = await cdp(tabId, "Page.captureScreenshot", params);
       }
     }
-    const m = await cdp(tabId, "Page.getLayoutMetrics");
-    const vp = m?.cssVisualViewport ?? {};
+    if (!params.clip) metrics = await cdp(tabId, "Page.getLayoutMetrics");
+    const vp = metrics?.cssVisualViewport ?? {};
     return {
       base64: r.data,
       format,
-      width: clip ? Math.round(clip.width * clip.scale) : Math.round(vp.clientWidth ?? 0),
-      height: clip ? Math.round(clip.height * clip.scale) : Math.round(vp.clientHeight ?? 0),
+      width: Math.round((params.clip?.width ?? vp.clientWidth ?? 0) * (params.clip?.scale ?? 1)),
+      height: Math.round((params.clip?.height ?? vp.clientHeight ?? 0) * (params.clip?.scale ?? 1)),
     };
   }),
 
   js: wrap(async (a) => {
     const tabId = await resolveTab(a);
-    // REPL 语义：顶层 await + 末表达式返回（复刻官方 javascript_exec）
-    const expr = `(async () => { const __r = await eval(${JSON.stringify(a.expression)}); return __r; })()`;
-    const v = await evaluate(tabId, expr, { awaitPromise: true });
+    // REPL 语义：顶层 await + 末表达式返回（包装逻辑见 page.js 的 replSource）
+    const v = await evaluate(tabId, replSource(a.expression), { awaitPromise: true });
     const s = v === undefined ? "undefined" : typeof v === "string" ? v : JSON.stringify(v, null, 2);
     return { content: [{ type: "text", text: String(s).slice(0, 50000) }] };
   }),
@@ -329,6 +372,9 @@ const TOOLS = {
     return { scrolled: true, scrollY: await evaluate(tabId, "Math.round(scrollY)") };
   }),
 
+  // 鼠标事件带超时：目标若是原生 HTML5 draggable，按下并移动会启动浏览器的拖放会话，
+  // 之后合成的鼠标事件不再返回（实测卡到 server 侧 90s 上限）。原生拖放合成事件驱动不了，
+  // 与其挂住不如尽快报错。超时后该标签页的拖放会话要等真实鼠标动作才会结束。
   drag: wrap(async (a) => {
     const tabId = await resolveTab(a);
     const from = a.fromX !== undefined && a.fromY !== undefined
@@ -337,12 +383,23 @@ const TOOLS = {
     const to = a.toX !== undefined && a.toY !== undefined
       ? { cx: a.toX, cy: a.toY }
       : await locateTarget(tabId, { ref: a.toRef, selector: a.toSelector });
+    const mouse = (params) => Promise.race([
+      cdp(tabId, "Input.dispatchMouseEvent", params),
+      new Promise((_, rej) => setTimeout(() => rej(new Error(`${NATIVE_DRAG_MSG} (a mouse event did not complete)`)), DRAG_MOUSE_TIMEOUT)),
+    ]);
+    // 上一次拖动（或划选文字）会在元素上留下文本选区：按在选区里再拖，Chrome 启动的是原生的
+    // "拖动选中文字"，之后的合成鼠标事件被吞掉，页面收不到 mouseup（实测连续拖放一成一败交替）。先清选区。
+    await evaluate(tabId, "getSelection().removeAllRanges()").catch(() => {});
+    // 原生 HTML5 draggable 同样驱动不了，而且工具照样返回成功：提前识别，直接报错
+    if (await evaluate(tabId, `!!document.elementFromPoint(${from.cx}, ${from.cy})?.closest('[draggable="true"]')`).catch(() => false)) {
+      throw new Error(NATIVE_DRAG_MSG);
+    }
     await indicator(tabId, "cursor", from.cx, from.cy);
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", x: from.cx, y: from.cy, button: "left", clickCount: 1 });
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: from.cx, y: from.cy, button: "left", clickCount: 1 });
+    await mouse({ type: "mouseMoved", x: from.cx, y: from.cy, button: "left", clickCount: 1 });
+    await mouse({ type: "mousePressed", x: from.cx, y: from.cy, button: "left", clickCount: 1 });
     const steps = Math.max(2, Math.min(20, a.steps ?? 10));
     for (let i = 1; i <= steps; i++) {
-      await cdp(tabId, "Input.dispatchMouseEvent", {
+      await mouse({
         type: "mouseMoved",
         button: "left",
         clickCount: 1,
@@ -351,7 +408,7 @@ const TOOLS = {
       });
       await new Promise((r) => setTimeout(r, 16));
     }
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: to.cx, y: to.cy, button: "left", clickCount: 1 });
+    await mouse({ type: "mouseReleased", x: to.cx, y: to.cy, button: "left", clickCount: 1 });
     await new Promise((r) => setTimeout(r, 250));
     return { dragged: true, url: await evaluate(tabId, "location.href") };
   }),
@@ -386,9 +443,7 @@ const TOOLS = {
     for (const f of fields) {
       await focusTarget(tabId, f);
       await new Promise((r) => setTimeout(r, 100));
-      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyDown", modifiers: 2, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 });
-      await cdp(tabId, "Input.dispatchKeyEvent", { type: "keyUp", modifiers: 2, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 });
-      await cdp(tabId, "Input.insertText", { text: String(f.value) });
+      await typeInto(tabId, f.value);
     }
     if (a.submit) {
       await pressKey(tabId, "Enter");
@@ -404,12 +459,16 @@ const TOOLS = {
     return { query: q, ...res };
   }),
 
+  // 最大化/全屏/最小化的窗口上只改 width/height 不生效（实测：最大化窗口原样返回）——先回到普通窗口
+  // 只改 width/height 对最大化/全屏/最小化的窗口不生效（实测：最大化窗口原样返回）。显式给了 state 就按它来；
+  // 否则这类窗口先回到普通窗口再改尺寸
   resize_window: wrap(async (a) => {
-    const win = await chrome.windows.update(a.windowId ?? chrome.windows.WINDOW_ID_CURRENT, {
-      ...(a.width ? { width: Math.round(a.width) } : {}),
-      ...(a.height ? { height: Math.round(a.height) } : {}),
-    });
-    return { windowId: win.id, width: win.width, height: win.height };
+    const win = await chrome.windows.get(a.windowId ?? chrome.windows.WINDOW_ID_CURRENT);
+    const size = { ...(a.width ? { width: Math.round(a.width) } : {}), ...(a.height ? { height: Math.round(a.height) } : {}) };
+    const state = ["normal", "maximized", "minimized"].includes(a.state) ? a.state : undefined;
+    const props = state ? { ...size, state } : win.state === "normal" ? size : { ...size, state: "normal" };
+    const w = await chrome.windows.update(win.id, props);
+    return { windowId: w.id, width: w.width, height: w.height, state: w.state };
   }),
 
   upload: wrap(async (a) => {
@@ -457,7 +516,7 @@ async function siteAllowed(url) {
     // 规则可带端口（如 localhost:3000，options 页文档明示支持）；不带端口的规则按域名匹配
     const hostPort = host + (u.port ? ":" + u.port : "");
     return allowedSites.some((pat) =>
-      host === pat || hostPort === pat || host.endsWith("." + pat) ||
+      hostPort === pat || host.endsWith("." + pat) ||
       new RegExp("^" + pat.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*") + "$").test(host)
     );
   } catch {
@@ -465,25 +524,12 @@ async function siteAllowed(url) {
   }
 }
 
-// 工具调用前的站点门禁（仅对会改变页面状态的工具生效）
-const GATED = new Set(["navigate", "click", "type", "js", "key", "hover", "drag", "scroll", "form_input", "upload"]);
+// 工具调用前的站点门禁（仅对会改变页面状态的工具生效；tab_new 带 url 等同于导航）
+const GATED = new Set(["navigate", "tab_new", "click", "type", "js", "key", "hover", "drag", "scroll", "form_input", "upload"]);
 
-async function activeTabUrl() {
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    return tab?.url ?? null;
-  } catch {
-    return null;
-  }
-}
+const activeTabUrl = async () => (await activeTab())?.url ?? null;
 
-async function tabUrl(tabId) {
-  try {
-    return (await chrome.tabs.get(tabId))?.url ?? null;
-  } catch {
-    return null;
-  }
-}
+const tabUrl = async (tabId) => (await chrome.tabs.get(tabId).catch(() => null))?.url ?? null;
 
 // 新开 tab 记录（click 感知弹出新 tab 用，官方同款能力）
 const recentCreated = [];
@@ -498,9 +544,9 @@ chrome.tabs.onCreated.addListener((t) => {
 async function dispatchTool(id, tool, args) {
   try {
     if (GATED.has(tool)) {
-      // back/forward 不算新 URL，不做站点门禁。
+      // navigate 的 back/forward、不带 url 的 tab_new 不打开新 URL，不做站点门禁。
       // 显式指定 tabId 时按目标 tab 的 URL 判定，而非活动 tab（后台 tab 会绕过/误伤）
-      const url = tool === "navigate"
+      const url = tool === "navigate" || tool === "tab_new"
         ? (/^(back|forward)$/i.test(String(args?.url)) ? null : args?.url)
         : typeof args?.tabId === "number"
           ? await tabUrl(args.tabId)

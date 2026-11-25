@@ -1,18 +1,39 @@
 // 工具面：对模型暴露的 browser_* 工具清单（schema 与描述）
-// handler 在扩展端实现（extension/tools.js），这里只负责 MCP tools/list 与参数校验。
+// handler 在扩展端实现（extension/tools.js；browser_status / browser_select 在 stdio.js 本地处理），
+// 这里只负责 MCP tools/list，不做参数校验。
 
 export const TOOLS = [
   {
     name: "browser_status",
     description:
       "Check claude-in-chrome connection status: whether the browser extension is connected, " +
-      "which browser/user agent it reports, and host version. Call this first when browser " +
-      "tools fail or before starting a browser workflow.",
+      "which browser(s) are attached (deviceId + label), and which one is selected. " +
+      "Call this first when browser tools fail or before starting a browser workflow.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
   },
   {
+    name: "browser_select",
+    description:
+      "With several browsers connected (each running the claude-in-chrome extension), pick which " +
+      "one the browser_* tools operate on. Without arguments, list connected browsers. Selection " +
+      "matches a deviceId, an unambiguous deviceId prefix, or the browser's label " +
+      "(set in the extension options page, defaults to the browser name e.g. Chrome/Edge). " +
+      "With a single browser connected no selection is needed.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        browser: { type: "string", description: "deviceId, id prefix, or label of the browser to operate on" },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
     name: "browser_navigate",
-    description: "Navigate the active tab (or a given tab) to a URL and wait for load. Also accepts \"back\"/\"forward\" for history navigation.",
+    description:
+      "Open a URL for the agent and wait for load. Without tabId this opens a NEW tab in the " +
+      "orange \"Claude\" tab group (your current tab is never touched); if the active tab is already " +
+      "an agent tab (in the Claude group) it navigates in place. A given tabId, or \"back\"/\"forward\", " +
+      "navigates that tab.",
     inputSchema: {
       type: "object",
       properties: {
@@ -220,7 +241,9 @@ export const TOOLS = [
   },
   {
     name: "browser_drag",
-    description: "Drag from one element/point to another (ref/selector or fromX/fromY → toRef/toSelector or toX/toY).",
+    description:
+      "Drag from one element/point to another (ref/selector or fromX/fromY → toRef/toSelector or toX/toY). " +
+      "Native HTML5 drag-and-drop (draggable elements) is not supported — dispatch drag events with browser_js.",
     inputSchema: {
       type: "object",
       properties: {
@@ -296,12 +319,15 @@ export const TOOLS = [
   },
   {
     name: "browser_resize_window",
-    description: "Resize the browser window (width/height in pixels).",
+    description:
+      "Resize the browser window (width/height in pixels). A maximized or minimized window is switched back to a " +
+      "normal window first (size changes do not apply to it); pass state to set normal/maximized/minimized explicitly.",
     inputSchema: {
       type: "object",
       properties: {
         width: { type: "number" },
         height: { type: "number" },
+        state: { type: "string", enum: ["normal", "maximized", "minimized"], description: "Window state to set" },
         windowId: { type: "number", description: "Defaults to current window" },
       },
       additionalProperties: false,

@@ -12,10 +12,16 @@ function rpcError(id, code, message) {
   return JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } });
 }
 
-const ERR = { tool: -32000, parse: -32700, method: -32601 };
+const ERR = { tool: -32000, parse: -32700, request: -32600, method: -32601 };
 
 async function handleRpc(req, bridge) {
+  // 非对象请求：按规范回 Invalid Request（id 置 null），而不是解引用崩溃
+  if (!req || typeof req !== "object" || Array.isArray(req)) {
+    return rpcError(null, ERR.request, "invalid request: expected an object");
+  }
   const { id, method, params } = req;
+  if (id === undefined) return null; // 通知（无 id）一律不回应
+  if (typeof method !== "string") return rpcError(id, ERR.request, "invalid request: missing method");
   switch (method) {
     case "initialize":
       return rpcResult(id, {
@@ -23,8 +29,6 @@ async function handleRpc(req, bridge) {
         capabilities: { tools: {} },
         serverInfo: SERVER_INFO,
       });
-    case "notifications/initialized":
-      return null; // 通知无响应
     case "ping":
       return rpcResult(id, {});
     case "tools/list":
@@ -34,6 +38,14 @@ async function handleRpc(req, bridge) {
       const args = params?.arguments ?? {};
       if (name === "browser_status") {
         return rpcResult(id, { content: [{ type: "text", text: bridge.statusText() }] });
+      }
+      if (name === "browser_select") {
+        // 多浏览器选择在 server 本地完成，不进扩展
+        try {
+          return rpcResult(id, { content: [{ type: "text", text: bridge.selectBrowser(args.browser) }] });
+        } catch (e) {
+          return rpcResult(id, { content: [{ type: "text", text: `error: ${e.message}` }], isError: true });
+        }
       }
       const spec = TOOLS.find((t) => t.name === name);
       if (!spec) return rpcError(id, ERR.method, `unknown tool: ${name}`);
@@ -85,11 +97,7 @@ export function startStdio(bridge) {
         .then((resp) => {
           if (resp !== null) process.stdout.write(resp + "\n");
         })
-        .catch((e) => {
-          if (req.id !== undefined) {
-            process.stdout.write(rpcError(req.id, ERR.tool, e.message) + "\n");
-          }
-        });
+        .catch((e) => process.stdout.write(rpcError(req?.id ?? null, ERR.tool, e.message) + "\n"));
     }
   });
   process.stdin.on("end", () => {

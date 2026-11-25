@@ -21,6 +21,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "popup_status") {
     sendResponse({
       connected: connState.connected,
+      hostUp: connState.hostUp,
       extensionId: chrome.runtime.id,
       userAgent: navigator.userAgent,
     });

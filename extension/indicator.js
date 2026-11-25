@@ -107,11 +107,11 @@ function scheduleIndicatorHide(delayMs = 2000) {
   }
 }
 
-/** tab 关闭时清理定时器与可见集合 */
-function forgetTab(tabId) {
+// tab 关闭（工具关闭或用户手动关）时清理定时器与可见集合
+chrome.tabs.onRemoved.addListener((tabId) => {
   clearTimeout(indicatorHideTimers.get(tabId));
   indicatorHideTimers.delete(tabId);
   indicatorShown.delete(tabId);
-}
+});
 
-export { indicator, showIndicator, scheduleIndicatorHide, forgetTab };
+export { indicator, showIndicator, scheduleIndicatorHide };
