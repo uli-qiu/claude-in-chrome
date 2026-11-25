@@ -29,15 +29,13 @@ function connectHost(port) {
 
 test("新会话逐出旧会话：旧会话休眠保活，host 重连到新会话", async () => {
   const port = BASE_PORT + portSeq++;
-  const a = startServer(port);
-  await a.waitLog("TCP bridge listening");
+  const a = await startServer(port);
 
   const host1 = await connectHost(port);
   await a.waitLog("host connected");
   assert.match(await a.status(), /connected: /);
 
-  const b = startServer(port); // 与 A 争同一端口 → 触发逐出
-  await b.waitLog("TCP bridge listening");
+  const b = await startServer(port); // 与 A 争同一端口：等到它把 A 逐出、自己开始监听
   await a.waitLog("evicted by newer session");
 
   // host 侧旧连接被持有者关闭（真实 host.exe 会以 ≤3s 退避重连到新持有者）
@@ -54,8 +52,7 @@ test("新会话逐出旧会话：旧会话休眠保活，host 重连到新会话
 
 test("evict 控制连接不会被持有者误当 host", async () => {
   const port = BASE_PORT + portSeq++;
-  const a = startServer(port);
-  await a.waitLog("TCP bridge listening");
+  const a = await startServer(port);
   const host = await connectHost(port);
   await a.waitLog("host connected");
 
@@ -71,8 +68,7 @@ test("evict 控制连接不会被持有者误当 host", async () => {
 
 test("普通 TCP 连接首帧非 hello/evict 被丢弃且不影响 host", async () => {
   const port = BASE_PORT + portSeq++;
-  const a = startServer(port);
-  await a.waitLog("TCP bridge listening");
+  const a = await startServer(port);
   const host = await connectHost(port);
   await a.waitLog("host connected");
 

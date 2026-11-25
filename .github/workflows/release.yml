@@ -23,7 +23,16 @@ jobs:
           node-version: 22
 
       - name: Run tests
-        run: node --test test/*.test.js
+        # 输出同时留给下一步：失败时提炼成注解，运行页上直接可见
+        run: node --test test/*.test.js 2>&1 | tee test-output.log
+
+      - name: Summarize test failures (as annotations)
+        if: failure()
+        # node:test 末尾的 "✖ failing tests:" 段：用例名 + 断言信息，每行一条 error 注解
+        run: |
+          sed -n '/✖ failing tests:/,$p' test-output.log | grep -vE '^\s*$' | head -40 \
+            | sed 's/::/%3A%3A/g' \
+            | while IFS= read -r line; do echo "::error title=Test failure::$line"; done
 
       - name: Regenerate icons (reproducible build check)
         run: node tools/gen-icon.mjs && git diff --exit-code -- extension/icons/

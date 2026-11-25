@@ -71,8 +71,7 @@ const until = async (cond, what, ms = 5000) => {
 };
 
 test("全链路：假扩展 → host.ts → TCP → MCP server", { skip: skipTs }, async (t) => {
-  const srv = startServer(PORT);
-  await sleep(700);
+  const srv = await startServer(PORT);
   const host = startHost(PORT, t);
 
   // TCP 连上：扩展先收到 bridge 状态；bridge 侧看到 host hello

@@ -29,8 +29,8 @@ export function connect(port, host = "127.0.0.1") {
   return sock;
 }
 
-/** 拉起 MCP server（监听 port），返回 stdio JSON-RPC 句柄 */
-export function startServer(port) {
+/** 拉起 MCP server，等它真正开始监听（端口被上一个 server 占着时，含逐出对方、重新 listen）再返回 */
+export async function startServer(port) {
   const p = spawn(process.execPath, [path.join(ROOT, "server/index.js")], {
     env: { ...process.env, CLAUDE_IN_CHROME_PORT: String(port) },
     stdio: ["pipe", "pipe", "pipe"],
@@ -75,6 +75,8 @@ export function startServer(port) {
           return (clearInterval(poll), rej(new Error(`timeout waiting "${pat}"`)));
       }, 30);
     });
+  // 不用固定 sleep：慢机器上进程冷启动 + 逐出旧持有者 + 120~300ms 抖动后才 listen，定死了会连接被拒
+  await waitLog("TCP bridge listening", 20000);
   return {
     p,
     rpc,

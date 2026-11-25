@@ -10,8 +10,7 @@ const PORT = 19000 + Math.floor(Math.random() * 500);
 after(cleanup);
 
 test("MCP stdio ↔ TCP ↔ host 全链路", async () => {
-  const srv = startServer(PORT);
-  await sleep(700);
+  const srv = await startServer(PORT);
 
   const init = await srv.rpc("initialize", {});
   assert.equal(init.result.serverInfo.name, "claude-in-chrome");
@@ -56,8 +55,7 @@ test("MCP stdio ↔ TCP ↔ host 全链路", async () => {
 // 回归：stdin 上一行 "null" 曾让 handleRpc 抛进 catch 后再次解引用崩溃（未处理的 rejection）；
 // 通知（无 id）曾被动回一条没有 id 的错误应答，违反 JSON-RPC。
 test("stdio 容错：非对象/缺 method 的请求报 Invalid Request，通知不回应，server 不崩", async () => {
-  const srv = startServer(PORT + 1);
-  await sleep(700);
+  const srv = await startServer(PORT + 1);
 
   srv.p.stdin.write("null\n");
   srv.p.stdin.write("[]\n");

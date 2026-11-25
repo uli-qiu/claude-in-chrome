@@ -41,8 +41,7 @@ function connectBrowser(deviceId, label, marker) {
 const text = (resp) => resp.result.content[0].text;
 
 test("两个浏览器并存：列出 → 拒猜 → browser_select 路由 → 断开回退", async () => {
-  const srv = startServer(PORT);
-  await sleep(700);
+  const srv = await startServer(PORT); // 上一个用例的 server 还占着端口：等它被逐出、新 server 开始监听
   const browserA = await connectBrowser("aaaa1111-0000-0000-0000-000000000001", "work-chrome", "BROWSER-A");
   await connectBrowser("bbbb2222-0000-0000-0000-000000000002", "work-edge", "BROWSER-B");
 
@@ -93,8 +92,7 @@ test("两个浏览器并存：列出 → 拒猜 → browser_select 路由 → �
 });
 
 test("同 deviceId 重连：旧连接被顶替，不产生重复条目", async () => {
-  const srv = startServer(PORT);
-  await sleep(700);
+  const srv = await startServer(PORT); // 上一个用例的 server 还占着端口：等它被逐出、新 server 开始监听
   await connectBrowser("cccc3333-0000-0000-0000-000000000003", "Chrome", "OLD");
   await connectBrowser("cccc3333-0000-0000-0000-000000000003", "Chrome", "NEW");
   // 单条：不走 "2 browsers" 分支
@@ -103,8 +101,7 @@ test("同 deviceId 重连：旧连接被顶替，不产生重复条目", async (
 });
 
 test("旧扩展无 deviceId：后连顶替先连（last-wins）", async () => {
-  const srv = startServer(PORT);
-  await sleep(700);
+  const srv = await startServer(PORT); // 上一个用例的 server 还占着端口：等它被逐出、新 server 开始监听
   // 只发 host.exe hello，不带扩展 hello（旧版扩展行为）。
   // server 对无 deviceId 的连接有 2s 宽限（等扩展 hello），到期才 last-wins 收敛。
   const legacy = connect(PORT);
@@ -127,8 +124,7 @@ test("旧扩展无 deviceId：后连顶替先连（last-wins）", async () => {
 // 扩展 hello 稍后才到。旧实现把"无 deviceId"当旧扩展立即互踢，两个 host
 // 在彼此扩展 hello 到达前无限循环顶替，server 永远看不到 deviceId。
 test("双 host 先连、扩展 hello 迟到：不互踢，均以 deviceId 注册", async () => {
-  const srv = startServer(PORT);
-  await sleep(700);
+  const srv = await startServer(PORT); // 上一个用例的 server 还占着端口：等它被逐出、新 server 开始监听
   const late = [];
   for (const [pid, deviceId, label] of [
     [101, "dddd4444-0000-0000-0000-000000000004", "late-chrome"],
